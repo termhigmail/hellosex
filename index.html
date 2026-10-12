@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>bbmodel viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #1c1e22; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+  #bar {
+    position: fixed; left: 12px; top: 12px;
+    display: flex; gap: 10px; align-items: center;
+    font: 13px/1.2 system-ui, sans-serif; color: #8d94a0;
+  }
+  #open {
+    font: inherit; color: #e6e8ec; background: #2b2f36;
+    border: 1px solid #3b414b; border-radius: 6px; padding: 7px 12px; cursor: pointer;
+  }
+  #open:hover { background: #343944; }
+  #open:focus-visible { outline: 2px solid #7aa2ff; outline-offset: 2px; }
+  #msg.err { color: #ff8f8f; }
+  #file { display: none; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <button id="open" type="button">Open .bbmodel</button>
+  <span id="msg"></span>
+</div>
+<input id="file" type="file" accept=".bbmodel,.json">
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ---------- scene ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1c1e22);
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 5000);
+scene.add(camera);
+scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+const headlight = new THREE.DirectionalLight(0xffffff, 0.6); // follows the camera so faces stay readable
+headlight.position.set(1, 1.5, 2);
+camera.add(headlight);
+
+// ---------- orbit (drag = rotate, right-drag/shift-drag = pan, wheel = zoom) ----------
+const target = new THREE.Vector3(0, 6, 0);
+let yaw = 0.6, pitch = 0.25, dist = 30;
+
+function updateCamera() {
+  pitch = Math.max(-1.5, Math.min(1.5, pitch));
+  camera.position.set(
+    target.x + dist * Math.sin(yaw) * Math.cos(pitch),
+    target.y + dist * Math.sin(pitch),
+    target.z + dist * Math.cos(yaw) * Math.cos(pitch)
+  );
+  camera.lookAt(target);
+}
+
+const el = renderer.domElement;
+let last = null;
+el.addEventListener('contextmenu', e => e.preventDefault());
+el.addEventListener('pointerdown', e => { last = { x: e.clientX, y: e.clientY }; el.setPointerCapture(e.pointerId); });
+el.addEventListener('pointerup', () => { last = null; });
+el.addEventListener('pointermove', e => {
+  if (!last) return;
+  const dx = e.clientX - last.x, dy = e.clientY - last.y;
+  last = { x: e.clientX, y: e.clientY };
+  if (e.shiftKey || (e.buttons & 2)) {
+    const right = new THREE.Vector3(), up = new THREE.Vector3(), fwd = new THREE.Vector3();
+    camera.updateMatrixWorld();
+    camera.matrixWorld.extractBasis(right, up, fwd);
+    const k = dist * 0.0016;
+    target.addScaledVector(right, -dx * k).addScaledVector(up, dy * k);
+  } else {
+    yaw -= dx * 0.008;
+    pitch += dy * 0.008;
+  }
+  updateCamera();
+});
+el.addEventListener('wheel', e => {
+  e.preventDefault();
+  dist = Math.max(1, Math.min(2000, dist * Math.exp(e.deltaY * 0.0012)));
+  updateCamera();
+}, { passive: false });
+
+function resize() {
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', resize);
+
+// ---------- bbmodel -> three ----------
+const RAD = Math.PI / 180;
+
+function buildModel(data) {
+  const root = new THREE.Group();
+  const res = data.resolution || { width: 16, height: 16 };
+
+  const mats = (data.textures || []).map(t => {
+    const img = new Image();
+    const tx = new THREE.Texture(img);
+    tx.magFilter = THREE.NearestFilter;
+    tx.minFilter = THREE.NearestFilter;
+    tx.generateMipmaps = false;
+    tx.encoding = THREE.sRGBEncoding;
+    img.onload = () => { tx.needsUpdate = true; };
+    img.src = t.source || t.path || '';
+    return new THREE.MeshLambertMaterial({ map: tx, side: THREE.DoubleSide, transparent: true, alphaTest: 0.1 });
+  });
+  const fallback = new THREE.MeshLambertMaterial({ color: 0xaaaaaa, side: THREE.DoubleSide });
+
+  const byUuid = {};
+  (data.elements || []).forEach(e => { byUuid[e.uuid] = e; });
+  (data.groups || []).forEach(g => { if (g && typeof g === 'object') byUuid[g.uuid] = g; });
+
+  const visited = new Set();
+
+  function addMesh(m, parent, po) {
+    visited.add(m.uuid);
+    if (m.visibility === false) return;
+    const o = m.origin || [0, 0, 0], r = m.rotation || [0, 0, 0];
+    const pivot = new THREE.Group();
+    pivot.position.set(o[0] - po[0], o[1] - po[1], o[2] - po[2]);
+    pivot.rotation.set(r[0] * RAD, r[1] * RAD, r[2] * RAD, 'ZYX');
+
+    // vertices are stored relative to the mesh origin; faces are polygons with per-vertex UVs
+    const buckets = new Map();
+    for (const f of Object.values(m.faces || {})) {
+      const vs = f.vertices || [];
+      if (vs.length < 3) continue;
+      const ti = typeof f.texture === 'number' ? f.texture : -1;
+      let b = buckets.get(ti);
+      if (!b) { b = { p: [], u: [] }; buckets.set(ti, b); }
+      const tex = (data.textures || [])[ti];
+      const w = Number(tex && tex.uv_width) || res.width;
+      const h = Number(tex && tex.uv_height) || res.height;
+      const tri = (a, c, d) => {
+        for (const k of [a, c, d]) {
+          const p = m.vertices[vs[k]];
+          b.p.push(p[0], p[1], p[2]);
+          const uv = (f.uv && f.uv[vs[k]]) || [0, 0];
+          b.u.push(uv[0] / w, 1 - uv[1] / h);
+        }
+      };
+      tri(0, 1, 2);
+      if (vs.length >= 4) tri(0, 2, 3);
+    }
+    for (const [ti, b] of buckets) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(b.p, 3));
+      geo.setAttribute('uv', new THREE.Float32BufferAttribute(b.u, 2));
+      geo.computeVertexNormals(); // non-indexed, so shading is flat
+      pivot.add(new THREE.Mesh(geo, mats[ti] || fallback));
+    }
+    parent.add(pivot);
+  }
+
+  function walk(nodes, parent, po) {
+    for (const n of nodes) {
+      if (typeof n === 'string') {
+        const e = byUuid[n];
+        if (e && e.type === 'mesh') addMesh(e, parent, po);
+        continue;
+      }
+      const g = byUuid[n.uuid];
+      const isRig = !g || g.type === 'armature' || g.type === 'armature_bone';
+      if (isRig) { walk(n.children || [], parent, po); continue; } // rest pose: ignore bone transforms
+      const o = g.origin || [0, 0, 0], r = g.rotation || [0, 0, 0];
+      const grp = new THREE.Group();
+      grp.position.set(o[0] - po[0], o[1] - po[1], o[2] - po[2]);
+      grp.rotation.set(r[0] * RAD, r[1] * RAD, r[2] * RAD, 'ZYX');
+      parent.add(grp);
+      walk(n.children || [], grp, o);
+    }
+  }
+
+  walk(data.outliner || [], root, [0, 0, 0]);
+  // meshes the outliner doesn't mention still get shown
+  (data.elements || []).forEach(e => { if (e.type === 'mesh' && !visited.has(e.uuid)) addMesh(e, root, [0, 0, 0]); });
+  return root;
+}
+
+// ---------- loading ----------
+const msg = document.getElementById('msg');
+let current = null;
+
+function disposeModel(obj) {
+  obj.traverse(o => {
+    if (o.geometry) o.geometry.dispose();
+    if (o.material) {
+      if (o.material.map) o.material.map.dispose();
+      o.material.dispose();
+    }
+  });
+}
+
+function show(text, isErr) { msg.textContent = text; msg.className = isErr ? 'err' : ''; }
+
+async function loadFile(file) {
+  try {
+    const data = JSON.parse(await file.text());
+    if (!data.elements) throw new Error('no "elements" found, is this a .bbmodel?');
+    const model = buildModel(data);
+    if (current) { scene.remove(current); disposeModel(current); }
+    current = model;
+    scene.add(model);
+
+    const box = new THREE.Box3().setFromObject(model);
+    if (box.isEmpty()) throw new Error('the model has no meshes to display');
+    const size = box.getSize(new THREE.Vector3());
+    box.getCenter(target);
+    dist = Math.max(size.x, size.y, size.z) * 1.6 / Math.tan(camera.fov * RAD / 2) / 2 + size.length() * 0.5;
+    updateCamera();
+    show(file.name);
+  } catch (err) {
+    show('Could not load: ' + err.message, true);
+  }
+}
+
+const input = document.getElementById('file');
+document.getElementById('open').addEventListener('click', () => input.click());
+input.addEventListener('change', () => { if (input.files[0]) loadFile(input.files[0]); input.value = ''; });
+window.addEventListener('dragover', e => e.preventDefault());
+window.addEventListener('drop', e => {
+  e.preventDefault();
+  if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+});
+
+resize();
+updateCamera();
+(function loop() { renderer.render(scene, camera); requestAnimationFrame(loop); })();
+</script>
+</body>
+</html>
